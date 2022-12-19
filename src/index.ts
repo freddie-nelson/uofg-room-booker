@@ -10,6 +10,11 @@ interface BookingTime {
   endHour: number;
 }
 
+interface RoomSchedule {
+  roomId: Room["id"];
+  freeTimes: { from: number; to: number; duration: number }[];
+}
+
 class UofGRoomBooker {
   protected MAX_BOOKING_DURATION = 3 * 60 * 60 * 1000; // 3 hours in milliseconds
   protected MAX_BOOKING_ADVANCE_DAYS = 7 * 24 * 60 * 60 * 1000; // 7 days in milliseconds
@@ -127,26 +132,55 @@ class UofGRoomBooker {
     this.validateBookingTime({ date, startHour: this.MIN_BOOKING_HOUR, endHour: this.MIN_BOOKING_HOUR + 1 });
 
     // find rooms available at every half hour interval of the given day
-    const schedule: { [index: number]: Room[] } = {};
+    const schedule: { [index: number]: Promise<Room[]> } = {};
 
     for (let i = this.MIN_BOOKING_HOUR; i < this.MAX_BOOKING_HOUR; i += 0.5) {
-      schedule[i] = await this.findRooms(attendees, { date, startHour: i, endHour: i + 0.5 });
+      schedule[i] = this.findRooms(attendees, { date, startHour: i, endHour: i + 0.5 });
     }
 
     await Promise.allSettled(Object.values(schedule));
 
     // get the times at which each individual room is free throughout the day
-    const roomSchedules: { [index: Room["id"]]: number[] } = {};
+    const roomFreeTimes: { [index: Room["id"]]: number[] } = {};
 
     for (const [time, rooms] of Object.entries(schedule).sort((a, b) => Number(a[0]) - Number(b[0]))) {
-      for (const room of rooms) {
-        if (!roomSchedules[room.id]) roomSchedules[room.id] = [];
+      for (const room of await rooms) {
+        if (!roomFreeTimes[room.id]) roomFreeTimes[room.id] = [];
 
-        roomSchedules[room.id].push(Number(time));
+        roomFreeTimes[room.id].push(Number(time));
       }
     }
 
-    console.log(roomSchedules);
+    // format into RoomSchedule objects
+    const roomSchedules: RoomSchedule[] = [];
+    for (const [roomId, times] of Object.entries(roomFreeTimes)) {
+      const freeTimes: RoomSchedule["freeTimes"] = [];
+
+      let start = times[0];
+
+      for (let i = 1; i <= times.length; i++) {
+        const last = times[i - 1];
+        const time = times[i];
+
+        // if there is a gap bigger than half an hour between times then
+        // the room must be booked between these times
+        // also add the time slot if we reach the end of the times array (time === undefined)
+        if (time - last !== 0.5 || time === undefined) {
+          freeTimes.push({
+            from: start,
+            to: last + 0.5,
+            duration: last + 0.5 - start,
+          });
+
+          start = time;
+        }
+      }
+
+      roomSchedules.push({
+        roomId,
+        freeTimes,
+      });
+    }
 
     return roomSchedules;
   }
