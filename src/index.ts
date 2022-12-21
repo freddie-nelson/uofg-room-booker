@@ -1,25 +1,71 @@
-interface Room {
-  id: string;
-  name: string;
-  capacity: number;
-}
-
 interface BookingTime {
   date: Date;
   startHour: number;
   endHour: number;
 }
 
-interface RoomSchedule {
-  roomId: Room["id"];
-  freeTimes: { from: number; to: number; duration: number }[];
+class RoomSchedule {
+  protected freeTimes: TimeInterval[] = [];
+
+  constructor(readonly date: Date, freeTimes: TimeInterval[] = []) {
+    this.addFreeTime(...freeTimes);
+  }
+
+  addFreeTime(...times: TimeInterval[]) {
+    this.freeTimes.push(...times);
+  }
+
+  isFree(time: number): boolean;
+  isFree(from: number, to: number): boolean;
+
+  isFree(time: number, to?: number) {
+    if (to !== undefined) return this.isFreeInterval(time, to);
+
+    return !!this.freeTimes.find((t) => time >= t.from && time <= t.to);
+  }
+
+  protected isFreeInterval(from: number, to: number) {
+    return !!this.freeTimes.find((t) => from >= t.from && from <= t.to && to >= t.from && to <= t.to);
+  }
+}
+
+class Room {
+  constructor(
+    readonly id: string,
+    readonly name: string,
+    readonly capacity: number,
+    public schedule?: RoomSchedule
+  ) {}
+
+  isFree(time: number): boolean;
+  isFree(from: number, to: number): boolean;
+
+  isFree(time: number, to?: number) {
+    if (!this.schedule) throw new Error("Room has no schedule.");
+
+    return this.schedule.isFree(time, to);
+  }
+}
+
+class TimeInterval {
+  constructor(public from: number, public to: number) {
+    if (from >= to) throw new Error("'from' time must be before 'to' time.");
+    if (from < 0 || from > 23 || to < 0 || to > 23)
+      throw new Error("Times must be between 0 and 23 inclusive.");
+  }
+
+  get duration() {
+    return this.to - this.from;
+  }
 }
 
 class UofGRoomBooker {
-  protected MAX_BOOKING_DURATION = 3 * 60 * 60 * 1000; // 3 hours in milliseconds
+  protected MAX_BOOKING_DURATION_HOURS = 3;
+  protected MAX_BOOKING_DURATION = this.MAX_BOOKING_DURATION_HOURS * 60 * 60 * 1000; // 3 hours in milliseconds
   protected MAX_BOOKING_ADVANCE_DAYS = 7 * 24 * 60 * 60 * 1000; // 7 days in milliseconds
   protected MIN_BOOKING_HOUR = 9;
   protected MAX_BOOKING_HOUR = 22;
+  protected BOOKING_TIME_INTERVAL = 0.5;
 
   protected MIN_ATTENDEES = 1;
   protected MAX_ATTENDEES = 7;
@@ -127,7 +173,76 @@ class UofGRoomBooker {
     return true;
   }
 
-  async findRoomSchedules(attendees: number, date: BookingTime["date"]) {
+  /**
+   * Books rooms so throughout the day a room will always be booked, based on rooms current schedules.
+   *
+   * @param rooms The rooms that can be booked (must have schedules)
+   * @param attendees The number of attendees to book for
+   */
+  async bookRoomsForDay(rooms: Room[], attendees: number) {
+    this.validateAttendees(attendees);
+
+    if (rooms.find((r) => !r.schedule)) throw new Error("A room provided does not have a schedule.");
+    if (rooms.find((r) => r.schedule.date.getTime() !== rooms[0].schedule.date.getTime()))
+      throw new Error("Every room must have a schedule from the same day.");
+
+    const validRooms = rooms.filter((r) => r.capacity >= attendees);
+
+    let currentHour = this.MIN_BOOKING_HOUR;
+    let currentDuration = this.MAX_BOOKING_DURATION_HOURS;
+    let bookedTo = 0;
+
+    let roomsToBook: { room: Room; time: BookingTime }[] = [];
+
+    while (bookedTo !== this.MAX_BOOKING_HOUR) {
+      let currentEndHour = currentHour + currentDuration;
+
+      const freeRoomIndex = validRooms.findIndex((r) => r.isFree(currentHour, currentEndHour));
+      const freeRoom = validRooms[freeRoomIndex];
+      if (!freeRoom) {
+        // no free room found so try to book for smaller duration
+        currentDuration -= this.BOOKING_TIME_INTERVAL;
+
+        // if booking duration reaches 0 then no room exists which is free at this time
+        if (currentDuration === 0) break;
+        else continue;
+      }
+
+      roomsToBook.push({
+        room: freeRoom,
+        time: {
+          date: freeRoom.schedule.date,
+          startHour: currentHour,
+          endHour: currentEndHour,
+        },
+      });
+      validRooms.splice(freeRoomIndex, 1);
+
+      bookedTo = currentEndHour;
+      currentHour += currentDuration;
+
+      // reset current duration but make sure currentHour + currentDuration will not exceed the MAX_BOOKING_HOUR
+      currentDuration = Math.min(this.MAX_BOOKING_HOUR - currentHour, this.MAX_BOOKING_DURATION_HOURS);
+    }
+
+    const bookedRooms = await Promise.allSettled(
+      roomsToBook.map(async (r) => {
+        await this.bookRoom(r.room.id, attendees, r.time);
+        return r;
+      })
+    ).then((res) => res.map((v) => (v.status === "fulfilled" ? v.value : v)));
+
+    return bookedRooms;
+  }
+
+  /**
+   * Finds all free rooms and their schedules for a given day.
+   *
+   * @param attendees The number of attendees
+   * @param date The booking date
+   * @returns An array of {@link Room} objects with their `schedule` field set to the found room schedule
+   */
+  async findRoomsWithSchedules(attendees: number, date: BookingTime["date"]) {
     this.validateAttendees(attendees);
     this.validateBookingTime({ date, startHour: this.MIN_BOOKING_HOUR, endHour: this.MIN_BOOKING_HOUR + 1 });
 
@@ -142,19 +257,22 @@ class UofGRoomBooker {
 
     // get the times at which each individual room is free throughout the day
     const roomFreeTimes: { [index: Room["id"]]: number[] } = {};
+    const foundRooms: { [index: Room["id"]]: Room } = {};
 
     for (const [time, rooms] of Object.entries(schedule).sort((a, b) => Number(a[0]) - Number(b[0]))) {
       for (const room of await rooms) {
-        if (!roomFreeTimes[room.id]) roomFreeTimes[room.id] = [];
+        if (!roomFreeTimes[room.id]) {
+          roomFreeTimes[room.id] = [];
+          foundRooms[room.id] = room;
+        }
 
         roomFreeTimes[room.id].push(Number(time));
       }
     }
 
     // format into RoomSchedule objects
-    const roomSchedules: RoomSchedule[] = [];
     for (const [roomId, times] of Object.entries(roomFreeTimes)) {
-      const freeTimes: RoomSchedule["freeTimes"] = [];
+      const schedule = new RoomSchedule(date);
 
       let start = times[0];
 
@@ -166,7 +284,7 @@ class UofGRoomBooker {
         // the room must be booked between these times
         // also add the time slot if we reach the end of the times array (time === undefined)
         if (time - last !== 0.5 || time === undefined) {
-          freeTimes.push({
+          schedule.addFreeTime({
             from: start,
             to: last + 0.5,
             duration: last + 0.5 - start,
@@ -176,13 +294,10 @@ class UofGRoomBooker {
         }
       }
 
-      roomSchedules.push({
-        roomId,
-        freeTimes,
-      });
+      foundRooms[roomId].schedule = schedule;
     }
 
-    return roomSchedules;
+    return Object.values(foundRooms);
   }
 
   protected validateBookingTime({ date, startHour, endHour }: BookingTime) {
@@ -241,11 +356,7 @@ class UofGRoomBooker {
 
   protected formatFindRoomsResponse(raw: any[][]): Room[] {
     return raw.map((rawRoom) => {
-      return <Room>{
-        id: rawRoom[0],
-        name: rawRoom[1],
-        capacity: rawRoom[2],
-      };
+      return new Room(rawRoom[0], rawRoom[1], rawRoom[2]);
     });
   }
 
@@ -281,15 +392,18 @@ class UofGRoomBooker {
 
   const attendees = 4;
   const time: BookingTime = {
-    date: new Date("20 Dec 2022"),
+    date: new Date("22 Dec 2022"),
     startHour: 9,
     endHour: 12,
   };
 
   await booker.login();
 
-  const schedule = await booker.findRoomSchedules(attendees, time.date);
-  console.log(schedule);
+  const rooms = await booker.findRoomsWithSchedules(attendees, time.date);
+  console.log(rooms);
+
+  const roomsToBook = await booker.bookRoomsForDay(rooms, attendees);
+  console.log(roomsToBook);
 
   // const availableRooms = await booker.findRooms(attendees, time);
   // console.log(availableRooms);
